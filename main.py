@@ -248,14 +248,13 @@ class Pitch:
 
     def screen_position(self, now):
         t = clamp(self.progress(now), 0.0, 1.12)
-        visual_t = smoothstep(clamp(t, 0.0, 1.0))
-        base = self.release_point.lerp(self.target_point, visual_t)
-        late = math.sin(clamp(t, 0.0, 1.0) * math.pi)
-        bend = pygame.Vector2(
-            self.spec.horizontal_break * late * (0.45 + 0.55 * t),
-            self.spec.vertical_break * late * (0.35 + 0.65 * t),
-        )
-        pos = base + bend
+        t01 = clamp(t, 0.0, 1.0)
+        visual_t = smoothstep(t01)
+        break_vector = pygame.Vector2(self.spec.horizontal_break, self.spec.vertical_break)
+        aim_point = self.target_point - break_vector
+        base = self.release_point.lerp(aim_point, visual_t)
+        break_t = t01 ** 1.55
+        pos = base + break_vector * break_t
         radius = lerp(4.0, 17.0, clamp(t, 0.0, 1.0) ** 1.45)
         return pos, radius
 
@@ -305,6 +304,7 @@ class HitBall:
         self.trail = []
         self.home_run = False
         self.foul = False
+        self.fielding_roll = random.random()
 
     @property
     def on_ground(self):
@@ -420,14 +420,14 @@ class Game:
 
     def _make_fielders(self):
         return [
-            Fielder("P", 0, 58, 76, (86, 150, 240)),
-            Fielder("1B", 88, 94, 78, (86, 150, 240)),
-            Fielder("2B", 42, 148, 80, (86, 150, 240)),
-            Fielder("SS", -58, 146, 80, (86, 150, 240)),
-            Fielder("3B", -88, 94, 78, (86, 150, 240)),
-            Fielder("LF", -168, 276, 88, (62, 126, 220)),
-            Fielder("CF", 0, 326, 90, (62, 126, 220)),
-            Fielder("RF", 168, 276, 88, (62, 126, 220)),
+            Fielder("P", 0, 58, 23, (86, 150, 240)),
+            Fielder("1B", 88, 94, 26, (86, 150, 240)),
+            Fielder("2B", 42, 148, 27, (86, 150, 240)),
+            Fielder("SS", -58, 146, 27, (86, 150, 240)),
+            Fielder("3B", -88, 94, 26, (86, 150, 240)),
+            Fielder("LF", -168, 276, 30, (62, 126, 220)),
+            Fielder("CF", 0, 326, 31, (62, 126, 220)),
+            Fielder("RF", 168, 276, 30, (62, 126, 220)),
         ]
 
     def run(self):
@@ -697,16 +697,39 @@ class Game:
             if fielder is primary:
                 route = play_target
                 speed_mod = 1.0 if ball.first_landing is None else 1.14
+                reaction = 0.22 if ball.launch_angle < 10 else 0.36
             elif fielder is self.backup_fielder:
                 route = cutoff_target
                 speed_mod = 0.76
+                reaction = 0.46
             else:
                 route = base_cover.get(fielder.name, fielder.home)
                 speed_mod = 0.54
+                reaction = 0.55
+            if ball.elapsed < reaction:
+                continue
             old_speed = fielder.speed
             fielder.speed = old_speed * speed_mod
             fielder.move_toward(route, dt)
             fielder.speed = old_speed
+
+    def catch_chance(self, ball, fielder_dist, catch_radius):
+        if ball.launch_angle < 6:
+            return 0.0
+        if ball.launch_angle < 14:
+            base = 0.26
+        elif ball.launch_angle < 22:
+            base = 0.52
+        elif ball.max_height > 85:
+            base = 0.78
+        else:
+            base = 0.64
+        if ball.exit_velo > 96 and ball.launch_angle < 20:
+            base -= 0.2
+        if ball.elapsed < 0.68:
+            base -= 0.18
+        distance_factor = clamp(1.0 - fielder_dist / max(1.0, catch_radius), 0.0, 1.0)
+        return clamp(base * (0.45 + distance_factor * 0.55), 0.0, 0.92)
 
     def update_in_play(self, dt, now):
         if not self.hit_ball:
@@ -723,12 +746,19 @@ class Game:
         primary = self.target_fielder or min(self.fielders, key=lambda f: (f.pos - pygame.Vector2(ball.pos.x, ball.pos.y)).length_squared())
         fielder_dist = (primary.pos - pygame.Vector2(ball.pos.x, ball.pos.y)).length()
 
-        catch_radius = 9.5
+        catch_radius = 6.8
         if ball.launch_angle < 12:
-            catch_radius = 6.0
+            catch_radius = 4.2
         elif ball.max_height > 75:
-            catch_radius = 11.5
-        if not ball.on_ground and ball.vel.z < 0 and ball.pos.z <= 10.0 and fielder_dist <= catch_radius:
+            catch_radius = 8.2
+        catchable = (
+            not ball.on_ground
+            and ball.vel.z < 0
+            and ball.pos.z <= 9.0
+            and fielder_dist <= catch_radius
+            and ball.fielding_roll <= self.catch_chance(ball, fielder_dist, catch_radius)
+        )
+        if catchable:
             if fair_now:
                 self.resolve_batted_ball("Caught", out=True, bases=0, special=f"{primary.name} makes the catch")
             else:
