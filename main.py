@@ -65,6 +65,17 @@ def world_to_screen(x, y, z=0.0):
     )
 
 
+def base_world(index):
+    positions = {
+        -1: pygame.Vector2(0, 0),
+        0: pygame.Vector2(90, 90),
+        1: pygame.Vector2(0, 180),
+        2: pygame.Vector2(-90, 90),
+        3: pygame.Vector2(0, 0),
+    }
+    return positions[index].copy()
+
+
 def fair_at(x, y):
     if y < 18:
         return True
@@ -305,17 +316,28 @@ class Fielder:
         self.pos = pygame.Vector2(x, y)
         self.speed = speed
         self.color = color
+        self.facing = pygame.Vector2(0, 1)
+        self.running_speed = 0.0
+        self.action = ""
+        self.action_until = 0.0
 
     def reset(self):
         self.pos.update(self.home)
+        self.running_speed = 0.0
+        self.action = ""
+        self.action_until = 0.0
 
     def move_toward(self, target, dt):
         delta = target - self.pos
         dist = delta.length()
         if dist <= 0.01:
+            self.running_speed = 0.0
             return
         step = min(dist, self.speed * dt)
-        self.pos += delta.normalize() * step
+        direction = delta.normalize()
+        self.facing = direction
+        self.running_speed = step / max(dt, 0.001)
+        self.pos += direction * step
 
 
 class HitBall:
@@ -405,7 +427,11 @@ class Game:
     def __init__(self):
         pygame.init()
         pygame.display.set_caption("Honkbal: PCI Batting")
-        self.screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.SCALED)
+        self.fullscreen = True
+        self.compact_ui = True
+        self.display = self.set_display_mode()
+        pygame.mouse.set_visible(False)
+        self.screen = pygame.Surface((WIDTH, HEIGHT)).convert()
         self.clock = pygame.time.Clock()
         self.fonts = {
             "small": pygame.font.SysFont("segoeui", 18),
@@ -451,11 +477,52 @@ class Game:
         self.last_hit_distance = 0.0
         self.last_hit_type = ""
         self.last_exit_velo = 0.0
+        self.last_launch_angle = 0.0
+        self.last_spray_angle = 0.0
+        self.last_contact_quality = 0.0
+        self.last_pci_score = 0.0
+        self.last_hit_subtype = ""
+        self.hit_card_until = 0.0
         self.message_alpha = 255
         self.cpu_notice = ""
         self.last_runs_scored = 0
+        self.total_outs = 0
+        self.challenge_best = 0
+
+        self.camera_shake_until = 0.0
+        self.camera_shake_power = 0.0
+        self.camera_zoom_until = 0.0
+        self.camera_zoom_amount = 0.0
+        self.slowmo_until = 0.0
+        self.result_view = "batter"
+        self.runner_anims = []
+        self.runner_anim_until = 0.0
+        self.last_runner_moves = []
+        self.throw_anim = None
 
         self.countdown_new_pitch(0.65)
+
+    def set_display_mode(self):
+        flags = pygame.SCALED
+        if self.fullscreen:
+            flags |= pygame.FULLSCREEN
+        attempts = [flags]
+        if self.fullscreen:
+            attempts.append(pygame.FULLSCREEN)
+        attempts.extend([pygame.SCALED, 0])
+        tried = set()
+        for mode_flags in attempts:
+            if mode_flags in tried:
+                continue
+            tried.add(mode_flags)
+            try:
+                display = pygame.display.set_mode((WIDTH, HEIGHT), mode_flags)
+                self.fullscreen = bool(mode_flags & pygame.FULLSCREEN)
+                return display
+            except pygame.error:
+                continue
+        self.fullscreen = False
+        return pygame.display.set_mode((WIDTH, HEIGHT))
 
     def _make_fielders(self):
         return [
@@ -474,9 +541,14 @@ class Game:
             dt = min(self.clock.tick(FPS) / 1000.0, 0.033)
             now = pygame.time.get_ticks() / 1000.0
             self.handle_events(now)
-            self.update(dt, now)
+            self.update(dt * self.time_scale(now), now)
             self.draw(now)
         pygame.quit()
+
+    def time_scale(self, now):
+        if self.state == "in_play" and now < self.slowmo_until:
+            return 0.38
+        return 1.0
 
     def handle_events(self, now):
         for event in pygame.event.get():
@@ -485,6 +557,11 @@ class Game:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     self.running = False
+                elif event.key == pygame.K_F11:
+                    self.fullscreen = not self.fullscreen
+                    self.display = self.set_display_mode()
+                elif event.key == pygame.K_h:
+                    self.compact_ui = not self.compact_ui
                 elif event.key == pygame.K_r:
                     self.reset_game()
                 elif event.key == pygame.K_SPACE:
@@ -520,11 +597,20 @@ class Game:
         self.strikes = 0
         self.outs = 0
         self.inning = 1
+        self.challenge_best = max(self.challenge_best, self.player_score)
         self.player_score = 0
         self.cpu_score = 0
+        self.total_outs = 0
         self.bases = [False, False, False]
         self.pitch = None
         self.hit_ball = None
+        self.runner_anims = []
+        self.throw_anim = None
+        self.hit_card_until = 0.0
+        self.camera_shake_until = 0.0
+        self.camera_zoom_until = 0.0
+        self.slowmo_until = 0.0
+        self.result_view = "batter"
         self.result_text = "Nieuwe wedstrijd"
         self.secondary_text = "Beweeg de gele PCI en time je swing."
         self.countdown_new_pitch(0.65)
@@ -539,6 +625,7 @@ class Game:
         self.hit_ball = None
         self.has_swung = False
         self.state = "pitch"
+        self.result_view = "batter"
         self.timing_feedback = "No Swing"
         self.contact_feedback = ""
         self.last_hit_type = ""
@@ -595,7 +682,7 @@ class Game:
             self.add_strike(chase, swing_miss=True)
             return
 
-        self.create_hit(contact_quality, timing_offset, mode)
+        self.create_hit(contact_quality, timing_offset, mode, pci_score)
 
     def timing_from_offset(self, offset, swing_timing_mod):
         abs_offset = abs(offset)
@@ -613,7 +700,7 @@ class Game:
             return ("Very Early" if offset < 0 else "Very Late"), 0.23
         return ("Very Early" if offset < 0 else "Very Late"), 0.0
 
-    def create_hit(self, quality, timing_offset, mode):
+    def create_hit(self, quality, timing_offset, mode, pci_score):
         assert self.pitch is not None
         target = self.pitch.target_point
         diff = self.pci_pos - target
@@ -655,9 +742,37 @@ class Game:
             spray += random.choice([-1, 1]) * random.uniform(22.0, 42.0)
         spray = clamp(spray, -68.0, 68.0)
 
+        subtype = "Clean Contact"
+        if vertical_delta < -0.52 and quality < 0.72:
+            subtype = "Chopper" if random.random() < 0.5 else "Hard Grounder"
+            launch = random.uniform(-8.0, 5.0)
+            exit_velo = clamp(exit_velo + random.uniform(-6.0, 5.0), 48.0, 106.0)
+            spray += random.choice([-1, 1]) * random.uniform(4.0, 14.0)
+        elif vertical_delta > 0.62 and quality < 0.7:
+            subtype = "Pop Up" if random.random() < 0.55 else "Bloop Fly"
+            launch = random.uniform(38.0, 64.0) if subtype == "Pop Up" else random.uniform(22.0, 34.0)
+            exit_velo = clamp(exit_velo * random.uniform(0.62, 0.82), 42.0, 78.0)
+        elif 0.38 <= quality <= 0.62 and random.random() < 0.24:
+            subtype = "Bloop Single"
+            launch = random.uniform(18.0, 30.0)
+            exit_velo = clamp(exit_velo * random.uniform(0.68, 0.82), 48.0, 76.0)
+            spray += random.choice([-1, 1]) * random.uniform(10.0, 22.0)
+        elif quality > 0.76 and 6.0 <= launch <= 18.0:
+            subtype = "Laser"
+            exit_velo = clamp(exit_velo + random.uniform(3.0, 8.0), 80.0, 116.5)
+        elif quality > 0.64 and 25.0 <= launch <= 38.0 and exit_velo < 99.0:
+            subtype = "Warning Track Fly"
+
+        spray = clamp(spray, -72.0, 72.0)
+
         spin_bias = random.uniform(-3.0, 3.0) + spray * 0.025
         self.hit_ball = HitBall(exit_velo, launch, spray, spin_bias)
         self.last_exit_velo = exit_velo
+        self.last_launch_angle = launch
+        self.last_spray_angle = spray
+        self.last_contact_quality = quality
+        self.last_pci_score = pci_score
+        self.last_hit_subtype = subtype
         self.last_hit_type = self.classify_hit_shape(launch)
         self.predicted_landing = self.predict_landing(self.hit_ball)
         self.target_fielder = self.pick_target_fielder(self.predicted_landing)
@@ -666,7 +781,14 @@ class Game:
             fielder.reset()
         self.state = "in_play"
         self.result_text = self.last_hit_type
-        self.secondary_text = f"Exit velo {exit_velo:.0f} mph | Launch {launch:.0f} deg"
+        self.secondary_text = f"{subtype} | Exit velo {exit_velo:.0f} mph | Launch {launch:.0f} deg"
+        now = pygame.time.get_ticks() / 1000.0
+        self.hit_card_until = now + 5.0
+        if self.timing_feedback == "Perfect Timing":
+            self.slowmo_until = now + 0.7
+            self.pulse_camera(now, shake=8.0, zoom=0.035, duration=0.55)
+        else:
+            self.pulse_camera(now, shake=4.5 + quality * 5.5, zoom=0.014 + quality * 0.018, duration=0.38)
         self.sounds.play("contact", 0.8)
 
     def classify_hit_shape(self, launch):
@@ -711,6 +833,13 @@ class Game:
                 best = fielder
                 best_dist = d
         return best
+
+    def mark_fielder_action(self, fielder, action, duration=0.8):
+        if not fielder:
+            return
+        now = pygame.time.get_ticks() / 1000.0
+        fielder.action = action
+        fielder.action_until = now + duration
 
     def update_fielder_routes(self, ball, dt):
         primary = self.target_fielder or self.pick_target_fielder(pygame.Vector2(ball.pos.x, ball.pos.y))
@@ -776,6 +905,7 @@ class Game:
         ball = self.hit_ball
         ball.update(dt)
         if ball.home_run:
+            self.pulse_camera(now, shake=15.0, zoom=0.07, duration=0.9)
             self.resolve_batted_ball("Home Run", out=False, bases=4, special="No doubt!")
             self.sounds.play("home_run", 0.95)
             return
@@ -798,6 +928,7 @@ class Game:
             and ball.fielding_roll <= self.catch_chance(ball, fielder_dist, catch_radius)
         )
         if catchable:
+            self.mark_fielder_action(primary, "catch", 1.1)
             if fair_now:
                 self.resolve_batted_ball("Caught", out=True, bases=0, special=f"{primary.name} makes the catch")
             else:
@@ -825,10 +956,19 @@ class Game:
         infield_grounder = ball.max_distance < 145 and ball.launch_angle < 8
         hard_to_side = abs(ball.spray_angle) > 28 and ball.exit_velo > 88
         if infield_grounder and not hard_to_side and ball.elapsed + throw_time < runner_time + random.uniform(-0.12, 0.22):
+            self.mark_fielder_action(fielder, "throw", 1.0)
+            now = pygame.time.get_ticks() / 1000.0
+            self.throw_anim = {
+                "start": fielder.pos.copy(),
+                "end": first_base,
+                "start_time": now,
+                "end_time": now + 0.48,
+            }
             self.resolve_batted_ball("Ground Out", out=True, bases=0, special=f"{fielder.name} throws to first")
             return
         bases = max(1, self.bases_from_distance(ball.max_distance, ball.launch_angle, ball.spray_angle))
         label = ["", "Single", "Double", "Triple"][bases]
+        self.mark_fielder_action(fielder, "field", 0.8)
         self.resolve_batted_ball(label, out=False, bases=bases, special=f"{fielder.name} fields it")
 
     def resolve_open_ball(self):
@@ -870,9 +1010,11 @@ class Game:
         runs_scored = 0
         if out:
             self.outs += 1
+            self.total_outs += 1
         elif bases > 0:
             runs_scored = self.advance_runners(bases, self.hit_ball)
         self.last_runs_scored = runs_scored
+        self.challenge_best = max(self.challenge_best, self.player_score)
 
         self.result_text = label
         distance_m = self.last_hit_distance * 0.3048
@@ -888,6 +1030,7 @@ class Game:
         self.pitch = None
         delay = 2.2 if label == "Home Run" else 1.55
         self.check_inning_end()
+        self.result_view = "field"
         self.state = "result"
         self.state_until = pygame.time.get_ticks() / 1000.0 + delay
 
@@ -896,6 +1039,7 @@ class Game:
         self.result_text = text
         self.secondary_text = f"Count {self.balls}-{self.strikes}"
         self.pitch = None
+        self.result_view = "batter"
         if self.balls >= 4:
             self.walk()
             return
@@ -910,8 +1054,10 @@ class Game:
         self.result_text = text
         self.secondary_text = f"Count {self.balls}-{self.strikes}"
         self.pitch = None
+        self.result_view = "batter"
         if self.strikes >= 3:
             self.outs += 1
+            self.total_outs += 1
             self.result_text = "Strikeout"
             self.secondary_text = "Three strikes"
             self.balls = 0
@@ -927,9 +1073,11 @@ class Game:
         self.result_text = "Walk"
         self.secondary_text = "Four balls"
         self.force_walk_runners()
+        self.challenge_best = max(self.challenge_best, self.player_score)
         self.balls = 0
         self.strikes = 0
         self.pitch = None
+        self.result_view = "batter"
         self.state = "result"
         self.state_until = pygame.time.get_ticks() / 1000.0 + 1.3
 
@@ -943,8 +1091,15 @@ class Game:
         self.bases[0] = True
 
     def advance_runners(self, bases, ball=None):
+        now = pygame.time.get_ticks() / 1000.0
+        self.runner_anims = []
         if bases >= 4:
             runs = 1 + sum(1 for occupied in self.bases if occupied)
+            for index, occupied in enumerate(self.bases):
+                if occupied:
+                    self.runner_anims.append(self.make_runner_anim(index, 3, now, 1.0 + (2 - index) * 0.12))
+            self.runner_anims.append(self.make_runner_anim(-1, 3, now, 1.35))
+            self.runner_anim_until = now + 1.5
             self.bases = [False, False, False]
             self.player_score += runs
             return runs
@@ -968,13 +1123,26 @@ class Game:
             new_index = index + advance
             if new_index >= 3:
                 runs += 1
+                self.runner_anims.append(self.make_runner_anim(index, 3, now, 0.95 + (2 - index) * 0.12))
             else:
                 new_bases[new_index] = True
+                self.runner_anims.append(self.make_runner_anim(index, new_index, now, 0.85 + advance * 0.16))
         if bases < 4:
             new_bases[bases - 1] = True
+            self.runner_anims.append(self.make_runner_anim(-1, bases - 1, now, 0.92 + bases * 0.18))
         self.bases = new_bases
         self.player_score += runs
+        self.runner_anim_until = now + 1.55
         return runs
+
+    def make_runner_anim(self, start_base, end_base, now, duration):
+        return {
+            "start": base_world(start_base),
+            "end": base_world(end_base),
+            "start_time": now,
+            "end_time": now + duration,
+            "scored": end_base == 3,
+        }
 
     def check_inning_end(self):
         if self.outs < 3:
@@ -990,12 +1158,43 @@ class Game:
         self.secondary_text = f"{self.secondary_text} | {self.cpu_notice}"
 
     def draw(self, now):
-        if self.state == "in_play":
+        self.screen.fill((0, 0, 0))
+        show_field_result = self.state == "result" and self.result_view == "field" and now < self.state_until
+        if self.state == "in_play" or show_field_result:
             self.draw_field_view(now)
         else:
             self.draw_batter_view(now)
+        self.apply_camera_to_display(now)
+        old_screen = self.screen
+        self.screen = self.display
         self.draw_hud(now)
+        self.screen = old_screen
         pygame.display.flip()
+
+    def apply_camera_to_display(self, now):
+        self.display.fill((0, 0, 0))
+        zoom = 1.0
+        if now < self.camera_zoom_until:
+            t = clamp((self.camera_zoom_until - now) / 0.9, 0.0, 1.0)
+            zoom += self.camera_zoom_amount * smoothstep(t)
+        offset = pygame.Vector2(0, 0)
+        if now < self.camera_shake_until:
+            t = clamp((self.camera_shake_until - now) / 0.45, 0.0, 1.0)
+            power = self.camera_shake_power * smoothstep(t)
+            offset.update(random.uniform(-power, power), random.uniform(-power, power))
+        if abs(zoom - 1.0) > 0.01:
+            scaled_size = (int(WIDTH * zoom), int(HEIGHT * zoom))
+            scaled = pygame.transform.smoothscale(self.screen, scaled_size)
+            rect = scaled.get_rect(center=(WIDTH // 2 + int(offset.x), HEIGHT // 2 + int(offset.y)))
+            self.display.blit(scaled, rect)
+        else:
+            self.display.blit(self.screen, (int(offset.x), int(offset.y)))
+
+    def pulse_camera(self, now, shake=8.0, zoom=0.025, duration=0.45):
+        self.camera_shake_power = shake if now >= self.camera_shake_until else max(self.camera_shake_power, shake)
+        self.camera_shake_until = max(self.camera_shake_until, now + duration)
+        self.camera_zoom_amount = zoom if now >= self.camera_zoom_until else max(self.camera_zoom_amount, zoom)
+        self.camera_zoom_until = max(self.camera_zoom_until, now + duration + 0.25)
 
     def draw_batter_view(self, now):
         self.draw_sky_and_stands()
@@ -1012,9 +1211,10 @@ class Game:
 
     def draw_vignette(self):
         edge = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-        for i in range(13):
-            alpha = int(7 + i * 2.4)
-            pygame.draw.rect(edge, (0, 0, 0, alpha), (-i * 16, -i * 10, WIDTH + i * 32, HEIGHT + i * 22), 18)
+        for i in range(18):
+            alpha = int(7 + i * 1.7)
+            rect = pygame.Rect(i * 9, i * 6, WIDTH - i * 18, HEIGHT - i * 12)
+            pygame.draw.rect(edge, (0, 0, 0, alpha), rect, width=12, border_radius=24)
         self.screen.blit(edge, (0, 0))
 
     def draw_sky_and_stands(self):
@@ -1106,20 +1306,55 @@ class Game:
 
     def draw_pitch(self, now):
         assert self.pitch is not None
+        pitch_name = self.pitch.spec.name
         for i, item in enumerate(self.pitch.tail):
             x, y, r = item
             alpha = i / max(1, len(self.pitch.tail) - 1)
+            trail_radius = max(1, int(r * (0.36 if pitch_name == "Fastball" else 0.5)))
             color = (
                 int(self.pitch.spec.color[0] * alpha),
                 int(self.pitch.spec.color[1] * alpha),
                 int(self.pitch.spec.color[2] * alpha),
             )
-            pygame.draw.circle(self.screen, color, (int(x), int(y)), max(1, int(r * 0.42)))
+            if pitch_name == "Slider" and i % 2 == 0:
+                pygame.draw.line(self.screen, color, (int(x - r * 0.7), int(y)), (int(x + r * 0.7), int(y)), 2)
+            elif pitch_name == "Curveball":
+                pygame.draw.circle(self.screen, color, (int(x), int(y)), trail_radius, 1)
+                if i % 3 == 0:
+                    pygame.draw.line(self.screen, color, (int(x), int(y - r * 0.6)), (int(x), int(y + r * 0.6)), 1)
+            elif pitch_name == "Changeup":
+                pygame.draw.circle(self.screen, color, (int(x), int(y)), trail_radius)
+                pygame.draw.circle(self.screen, (80, 255, 170), (int(x), int(y)), max(1, trail_radius + 2), 1)
+            elif pitch_name == "Sinker":
+                pygame.draw.line(self.screen, color, (int(x - r * 0.3), int(y - r * 0.7)), (int(x + r * 0.3), int(y + r * 0.7)), 2)
+            else:
+                pygame.draw.circle(self.screen, color, (int(x), int(y)), trail_radius)
         pos, radius = self.pitch.screen_position(now)
         draw_soft_circle(self.screen, (int(pos.x), int(pos.y)), radius * 2.2, (255, 248, 210, 58), 6)
         pygame.draw.circle(self.screen, (250, 250, 246), (int(pos.x), int(pos.y)), int(radius))
         pygame.draw.circle(self.screen, (255, 255, 255), (int(pos.x - radius * 0.25), int(pos.y - radius * 0.25)), max(1, int(radius * 0.18)))
-        pygame.draw.circle(self.screen, (156, 38, 44), (int(pos.x - radius * 0.15), int(pos.y)), max(1, int(radius * 0.16)))
+        t = clamp(self.pitch.progress(now), 0.0, 1.0)
+        spin_rates = {
+            "Fastball": 42.0,
+            "Slider": -28.0,
+            "Curveball": 18.0,
+            "Changeup": 10.0,
+            "Sinker": 31.0,
+        }
+        spin = t * spin_rates.get(pitch_name, 24.0)
+        seam_color = (156, 38, 44)
+        for angle_offset in (0.0, math.pi):
+            angle = spin + angle_offset
+            a = pygame.Vector2(math.cos(angle), math.sin(angle)) * radius * 0.58
+            b = pygame.Vector2(math.cos(angle + 0.72), math.sin(angle + 0.72)) * radius * 0.58
+            pygame.draw.arc(
+                self.screen,
+                seam_color,
+                (pos.x - radius * 0.62 + a.x * 0.1, pos.y - radius * 0.62 + b.y * 0.1, radius * 1.22, radius * 1.22),
+                angle - 0.8,
+                angle + 0.8,
+                max(1, int(radius * 0.12)),
+            )
         pygame.draw.arc(
             self.screen,
             (170, 42, 48),
@@ -1177,8 +1412,10 @@ class Game:
     def draw_field_view(self, now):
         self.draw_field_background()
         self.draw_field_lines()
+        self.draw_runner_visuals(now)
         for fielder in self.fielders:
-            self.draw_fielder(fielder)
+            self.draw_fielder(fielder, now)
+        self.draw_throw_anim(now)
         if self.hit_ball:
             self.draw_hit_ball()
         self.draw_vignette()
@@ -1245,12 +1482,63 @@ class Game:
             ],
         )
 
-    def draw_fielder(self, fielder):
+    def draw_runner_visuals(self, now):
+        if now < self.runner_anim_until:
+            for anim in self.runner_anims:
+                t = clamp((now - anim["start_time"]) / max(0.01, anim["end_time"] - anim["start_time"]), 0.0, 1.0)
+                eased = smoothstep(t)
+                world = anim["start"].lerp(anim["end"], eased)
+                self.draw_runner(world, active=True, scored=anim["scored"])
+        else:
+            for index, occupied in enumerate(self.bases):
+                if occupied:
+                    self.draw_runner(base_world(index), active=False, scored=False)
+
+    def draw_runner(self, world_pos, active=False, scored=False):
+        p = world_to_screen(world_pos.x, world_pos.y, 0)
+        color = (255, 225, 92) if active else (238, 242, 248)
+        if scored:
+            color = (114, 232, 148)
+        pygame.draw.ellipse(self.screen, (9, 34, 24), (p.x - 8, p.y + 7, 16, 6))
+        pygame.draw.circle(self.screen, (26, 34, 48), (int(p.x), int(p.y)), 8)
+        pygame.draw.circle(self.screen, color, (int(p.x), int(p.y - 2)), 6)
+        pygame.draw.circle(self.screen, (238, 210, 180), (int(p.x), int(p.y - 9)), 4)
+        if active:
+            pygame.draw.line(self.screen, color, (p.x - 4, p.y + 4), (p.x - 10, p.y + 10), 2)
+            pygame.draw.line(self.screen, color, (p.x + 4, p.y + 4), (p.x + 10, p.y + 10), 2)
+
+    def draw_throw_anim(self, now):
+        if not self.throw_anim:
+            return
+        if now > self.throw_anim["end_time"]:
+            self.throw_anim = None
+            return
+        t = clamp((now - self.throw_anim["start_time"]) / max(0.01, self.throw_anim["end_time"] - self.throw_anim["start_time"]), 0.0, 1.0)
+        pos = self.throw_anim["start"].lerp(self.throw_anim["end"], smoothstep(t))
+        start = world_to_screen(self.throw_anim["start"].x, self.throw_anim["start"].y, 4)
+        end = world_to_screen(pos.x, pos.y, 5)
+        pygame.draw.line(self.screen, (255, 244, 185), start, end, 2)
+        draw_soft_circle(self.screen, (int(end.x), int(end.y)), 14, (255, 237, 156, 48), 4)
+        pygame.draw.circle(self.screen, (255, 252, 240), (int(end.x), int(end.y)), 4)
+
+    def draw_fielder(self, fielder, now):
         p = world_to_screen(fielder.pos.x, fielder.pos.y)
+        stride = math.sin(now * 18.0) * clamp(fielder.running_speed / max(1.0, fielder.speed), 0.0, 1.0)
+        glove = pygame.Vector2(-fielder.facing.y, fielder.facing.x) * 8 + pygame.Vector2(fielder.facing.x, -fielder.facing.y) * 4
+        if fielder.action and now < fielder.action_until:
+            if fielder.action == "catch":
+                glove = pygame.Vector2(fielder.facing.x * 4, -18)
+            elif fielder.action == "throw":
+                glove = pygame.Vector2(-fielder.facing.x * 12, -14)
+            elif fielder.action == "field":
+                glove = pygame.Vector2(fielder.facing.x * 10, 5)
         pygame.draw.ellipse(self.screen, (8, 31, 22), (p.x - 12, p.y + 8, 24, 8))
+        pygame.draw.line(self.screen, (24, 40, 70), (p.x - 4, p.y + 8), (p.x - 8 - stride * 4, p.y + 16), 3)
+        pygame.draw.line(self.screen, (24, 40, 70), (p.x + 4, p.y + 8), (p.x + 8 + stride * 4, p.y + 16), 3)
         pygame.draw.circle(self.screen, (17, 31, 49), (int(p.x), int(p.y)), 11)
         pygame.draw.circle(self.screen, fielder.color, (int(p.x), int(p.y)), 9)
         pygame.draw.rect(self.screen, (235, 240, 248), (p.x - 6, p.y - 3, 12, 8), border_radius=3)
+        pygame.draw.circle(self.screen, (143, 92, 52), (int(p.x + glove.x), int(p.y + glove.y)), 5)
         pygame.draw.circle(self.screen, (237, 220, 190), (int(p.x), int(p.y - 10)), 5)
         pygame.draw.circle(self.screen, (30, 45, 76), (int(p.x), int(p.y - 14)), 5)
         label = self.fonts["small"].render(fielder.name, True, (236, 240, 248))
@@ -1272,11 +1560,54 @@ class Game:
         self.last_hit_distance = ball.max_distance
 
     def draw_hud(self, now):
+        if self.compact_ui:
+            self.draw_compact_hud(now)
+            self.draw_compact_hit_card(now)
+            return
         self.draw_score_bug()
         self.draw_feedback_panel()
+        self.draw_hit_card(now)
         self.draw_controls_strip()
         if self.state == "in_play":
             self.draw_in_play_panel()
+
+    def draw_compact_hud(self, now):
+        draw_glass_panel(self.screen, (18, 16, 316, 74), (7, 12, 21, 168), (255, 255, 255, 26), 9)
+        score = self.fonts["score"].render(f"JIJ {self.player_score}  CPU {self.cpu_score}", True, (246, 249, 255))
+        self.screen.blit(score, (34, 24))
+        status = self.fonts["small"].render(
+            f"Inning {self.inning}   Count {self.balls}-{self.strikes}   Outs {self.outs}",
+            True,
+            (213, 222, 235),
+        )
+        self.screen.blit(status, (36, 57))
+        self.draw_bases(294, 52)
+
+        draw_glass_panel(self.screen, (WIDTH - 356, 16, 338, 74), (7, 12, 21, 150), (255, 255, 255, 24), 9)
+        pitch = self.fonts["small"].render(self.pitch_feedback, True, (230, 236, 246))
+        timing_color = TIMING_COLORS.get(self.timing_feedback, (232, 236, 244))
+        timing = self.fonts["body"].render(self.timing_feedback, True, timing_color)
+        self.screen.blit(pitch, (WIDTH - 338, 25))
+        self.screen.blit(timing, (WIDTH - 338, 51))
+        hint = self.fonts["small"].render("H UI  F11 Fullscreen", True, (143, 156, 174))
+        self.screen.blit(hint, hint.get_rect(center=(WIDTH // 2, HEIGHT - 22)))
+
+    def draw_compact_hit_card(self, now):
+        if now > self.hit_card_until or not self.last_hit_type:
+            return
+        w = 430
+        h = 56
+        x = WIDTH // 2 - w // 2
+        y = 18
+        draw_glass_panel(self.screen, (x, y, w, h), (7, 12, 21, 178), (255, 255, 255, 26), 9)
+        title = self.fonts["bold"].render(self.last_hit_subtype or self.last_hit_type, True, (255, 232, 118))
+        metrics = self.fonts["small"].render(
+            f"EV {self.last_exit_velo:.0f} mph   LA {self.last_launch_angle:.0f}   {self.last_hit_distance:.0f} ft   PCI {self.last_pci_score * 100:.0f}%",
+            True,
+            (223, 231, 242),
+        )
+        self.screen.blit(title, (x + 16, y + 10))
+        self.screen.blit(metrics, (x + 170, y + 20))
 
     def draw_score_bug(self):
         draw_glass_panel(self.screen, (20, 18, 340, 184), (8, 13, 23, 210), (255, 255, 255, 42), 10)
@@ -1285,10 +1616,12 @@ class Game:
         self.screen.blit(title, (38, 30))
         inning = self.fonts["body"].render(f"Inning {self.inning}", True, (205, 214, 226))
         self.screen.blit(inning, (39, 66))
+        challenge = self.fonts["small"].render(f"Challenge {self.total_outs}/10 outs  Best {self.challenge_best}", True, (255, 226, 112))
+        self.screen.blit(challenge, (38, 88))
 
-        self.draw_count_dots("Balls", self.balls, 4, (79, 224, 132), 40, 108)
-        self.draw_count_dots("Strikes", self.strikes, 3, (245, 188, 70), 40, 134)
-        self.draw_count_dots("Outs", self.outs, 3, (255, 97, 97), 40, 160)
+        self.draw_count_dots("Balls", self.balls, 4, (79, 224, 132), 40, 116)
+        self.draw_count_dots("Strikes", self.strikes, 3, (245, 188, 70), 40, 142)
+        self.draw_count_dots("Outs", self.outs, 3, (255, 97, 97), 40, 168)
         self.draw_bases(292, 132)
 
     def draw_count_dots(self, label, count, total, color, x, y):
@@ -1335,6 +1668,32 @@ class Game:
             right = self.fonts["body"].render(value, True, color)
             self.screen.blit(left, (x + 18, yy + 5))
             self.screen.blit(right, (x + 106, yy))
+
+    def draw_hit_card(self, now):
+        if now > self.hit_card_until or not self.last_hit_type:
+            return
+        x = WIDTH - 366
+        y = 202
+        draw_glass_panel(self.screen, (x, y, 346, 142), (8, 13, 23, 200), (255, 255, 255, 38), 10)
+        title = self.fonts["bold"].render(self.last_hit_subtype or self.last_hit_type, True, (255, 232, 118))
+        self.screen.blit(title, (x + 18, y + 14))
+        metrics = [
+            ("EV", f"{self.last_exit_velo:.0f} mph"),
+            ("LA", f"{self.last_launch_angle:.0f} deg"),
+            ("DIST", f"{self.last_hit_distance:.0f} ft"),
+            ("PCI", f"{self.last_pci_score * 100:.0f}%"),
+            ("TIMING", self.timing_feedback.replace(" Timing", "")),
+            ("QUALITY", f"{self.last_contact_quality * 100:.0f}%"),
+        ]
+        for i, (label, value) in enumerate(metrics):
+            col = i % 2
+            row = i // 2
+            mx = x + 18 + col * 158
+            my = y + 56 + row * 26
+            lab = self.fonts["small"].render(label, True, (138, 151, 169))
+            val = self.fonts["small"].render(value, True, (232, 238, 248))
+            self.screen.blit(lab, (mx, my))
+            self.screen.blit(val, (mx + 64, my))
 
     def draw_controls_strip(self):
         text = "Muis: PCI   Linksklik/Space: normal   Rechtermuisknop/X: power   Shift+klik/C: contact   R: reset"
