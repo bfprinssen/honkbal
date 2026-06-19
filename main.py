@@ -32,6 +32,14 @@ def lerp(a, b, t):
     return a + (b - a) * t
 
 
+def mix_color(a, b, t):
+    return (
+        int(lerp(a[0], b[0], t)),
+        int(lerp(a[1], b[1], t)),
+        int(lerp(a[2], b[2], t)),
+    )
+
+
 def smoothstep(t):
     t = clamp(t, 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
@@ -65,6 +73,37 @@ def fair_at(x, y):
 
 def distance_ft(x, y):
     return math.hypot(x, y)
+
+
+def draw_vertical_gradient(surface, top_color, bottom_color, rect=None):
+    rect = pygame.Rect(rect) if rect else surface.get_rect()
+    height = max(1, rect.height - 1)
+    for y in range(rect.top, rect.bottom):
+        t = (y - rect.top) / height
+        pygame.draw.line(surface, mix_color(top_color, bottom_color, t), (rect.left, y), (rect.right, y))
+
+
+def draw_glass_panel(surface, rect, fill=(12, 18, 28, 190), border=(255, 255, 255, 42), radius=8):
+    rect = pygame.Rect(rect)
+    panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+    pygame.draw.rect(panel, fill, panel.get_rect(), border_radius=radius)
+    pygame.draw.rect(panel, (255, 255, 255, 22), (1, 1, rect.width - 2, max(8, rect.height // 3)), border_radius=radius)
+    pygame.draw.rect(panel, border, panel.get_rect().inflate(-1, -1), 1, border_radius=radius)
+    surface.blit(panel, rect.topleft)
+
+
+def draw_soft_circle(surface, pos, radius, color, layers=7):
+    radius = int(radius)
+    size = radius * 2 + 6
+    glow = pygame.Surface((size, size), pygame.SRCALPHA)
+    center = (size // 2, size // 2)
+    r, g, b, alpha = color
+    for i in range(layers, 0, -1):
+        frac = i / layers
+        layer_radius = max(1, int(radius * frac))
+        layer_alpha = int(alpha * (1.0 - frac + 1.0 / layers) ** 1.8)
+        pygame.draw.circle(glow, (r, g, b, layer_alpha), center, layer_radius)
+    surface.blit(glow, (pos[0] - size // 2, pos[1] - size // 2))
 
 
 @dataclass(frozen=True)
@@ -968,48 +1007,66 @@ class Game:
         self.draw_pci(now)
         if now < self.swing_flash_until:
             self.draw_bat_swing(now)
+        self.draw_vignette()
         self.draw_center_feedback(now)
 
-    def draw_sky_and_stands(self):
-        for y in range(0, HEIGHT):
-            ratio = y / HEIGHT
-            if y < 340:
-                c = (
-                    int(18 + 20 * ratio),
-                    int(33 + 42 * ratio),
-                    int(58 + 58 * ratio),
-                )
-            else:
-                c = (
-                    int(26 + 12 * ratio),
-                    int(76 + 48 * ratio),
-                    int(43 + 18 * ratio),
-                )
-            pygame.draw.line(self.screen, c, (0, y), (WIDTH, y))
+    def draw_vignette(self):
+        edge = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        for i in range(13):
+            alpha = int(7 + i * 2.4)
+            pygame.draw.rect(edge, (0, 0, 0, alpha), (-i * 16, -i * 10, WIDTH + i * 32, HEIGHT + i * 22), 18)
+        self.screen.blit(edge, (0, 0))
 
-        pygame.draw.rect(self.screen, (15, 22, 33), (0, 95, WIDTH, 124))
-        pygame.draw.rect(self.screen, (23, 30, 42), (0, 142, WIDTH, 96))
-        for row in range(4):
-            y = 112 + row * 24
-            for x in range(8, WIDTH, 18):
-                shade = 54 + ((x + row * 19) % 60)
-                pygame.draw.circle(self.screen, (shade, shade + 6, shade + 18), (x, y), 3)
-        pygame.draw.rect(self.screen, (37, 84, 61), (0, 224, WIDTH, 70))
-        pygame.draw.rect(self.screen, (74, 58, 46), (0, 292, WIDTH, 22))
-        for x in range(72, WIDTH, 180):
-            pygame.draw.circle(self.screen, (255, 247, 191), (x, 72), 5)
-            pygame.draw.line(self.screen, (91, 103, 116), (x, 72), (x + 12, 205), 2)
+    def draw_sky_and_stands(self):
+        draw_vertical_gradient(self.screen, (8, 18, 35), (36, 86, 60))
+        pygame.draw.rect(self.screen, (9, 16, 27), (0, 82, WIDTH, 172))
+        pygame.draw.rect(self.screen, (17, 26, 39), (0, 130, WIDTH, 126))
+        pygame.draw.rect(self.screen, (47, 82, 66), (0, 238, WIDTH, 54))
+        pygame.draw.rect(self.screen, (104, 77, 56), (0, 288, WIDTH, 28))
+
+        scoreboard = pygame.Rect(WIDTH // 2 - 130, 105, 260, 58)
+        draw_glass_panel(self.screen, scoreboard, (6, 13, 24, 220), (255, 255, 255, 34), 7)
+        title = self.fonts["small"].render("PCI BATTING", True, (255, 226, 112))
+        self.screen.blit(title, title.get_rect(center=(scoreboard.centerx, scoreboard.centery - 10)))
+        score = self.fonts["score"].render(f"{self.player_score} - {self.cpu_score}", True, (238, 244, 255))
+        self.screen.blit(score, score.get_rect(center=(scoreboard.centerx, scoreboard.centery + 14)))
+
+        for row in range(5):
+            y = 104 + row * 27
+            for x in range(10, WIDTH, 16):
+                shade = 44 + ((x * 3 + row * 31) % 58)
+                accent = 18 if (x + row) % 7 == 0 else 0
+                pygame.draw.circle(self.screen, (shade + accent, shade + 8, shade + 22), (x, y), 3)
+
+        for x in (92, 268, WIDTH - 268, WIDTH - 92):
+            pygame.draw.line(self.screen, (69, 82, 97), (x, 78), (x + (18 if x < WIDTH / 2 else -18), 234), 4)
+            for i in range(4):
+                lx = x + (i - 1.5) * 16
+                draw_soft_circle(self.screen, (lx, 72), 18, (255, 244, 190, 72), 5)
+                pygame.draw.circle(self.screen, (255, 245, 200), (int(lx), 72), 4)
 
     def draw_infield_perspective(self):
-        mound = pygame.Rect(574, 302, 132, 28)
-        pygame.draw.ellipse(self.screen, (148, 105, 70), mound)
-        pygame.draw.ellipse(self.screen, (102, 72, 48), mound, 3)
+        grass = [(0, 316), (WIDTH, 316), (WIDTH, HEIGHT), (0, HEIGHT)]
+        pygame.draw.polygon(self.screen, (28, 118, 70), grass)
+        for i in range(9):
+            y = 316 + i * 48
+            color = (32, 132, 77) if i % 2 == 0 else (24, 105, 64)
+            pygame.draw.polygon(self.screen, color, [(0, y), (WIDTH, y + 28), (WIDTH, y + 72), (0, y + 44)])
+        dirt = [(218, 360), (1062, 360), (836, 676), (444, 676)]
+        pygame.draw.polygon(self.screen, (147, 101, 65), dirt)
+        pygame.draw.polygon(self.screen, (115, 77, 49), dirt, 4)
+        mound = pygame.Rect(568, 300, 144, 32)
+        pygame.draw.ellipse(self.screen, (165, 117, 76), mound)
+        pygame.draw.ellipse(self.screen, (93, 64, 42), mound, 3)
+        pygame.draw.rect(self.screen, (229, 223, 204), (620, 307, 40, 4), border_radius=2)
         plate = [(604, 636), (676, 636), (690, 660), (640, 684), (590, 660)]
+        pygame.draw.polygon(self.screen, (42, 38, 31), [(598, 641), (682, 641), (698, 664), (640, 692), (582, 664)])
         pygame.draw.polygon(self.screen, (226, 225, 208), plate)
         pygame.draw.polygon(self.screen, (42, 45, 42), plate, 2)
-        pygame.draw.line(self.screen, (183, 142, 99), (640, 662), (1020, 357), 4)
-        pygame.draw.line(self.screen, (183, 142, 99), (640, 662), (260, 357), 4)
-        pygame.draw.arc(self.screen, (130, 92, 62), (418, 438, 444, 180), math.pi, math.tau, 3)
+        pygame.draw.line(self.screen, (231, 211, 154), (640, 662), (1038, 356), 3)
+        pygame.draw.line(self.screen, (231, 211, 154), (640, 662), (242, 356), 3)
+        pygame.draw.arc(self.screen, (98, 68, 45), (410, 436, 460, 188), math.pi, math.tau, 3)
+        draw_soft_circle(self.screen, (640, 650), 105, (255, 226, 136, 25), 7)
 
     def draw_pitcher(self, now):
         base = pygame.Vector2(WIDTH * 0.5, 276)
@@ -1030,14 +1087,21 @@ class Game:
         pygame.draw.circle(self.screen, (35, 42, 54), (int(base.x), int(base.y - 70)), 12)
 
     def draw_strike_zone(self):
+        glow_rect = STRIKE_ZONE.inflate(20, 20)
+        glow = pygame.Surface(glow_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(glow, (112, 194, 255, 36), glow.get_rect(), border_radius=8)
+        pygame.draw.rect(glow, (255, 255, 255, 20), glow.get_rect().inflate(-8, -8), 1, border_radius=6)
+        self.screen.blit(glow, glow_rect.topleft)
+
         overlay = pygame.Surface((STRIKE_ZONE.width, STRIKE_ZONE.height), pygame.SRCALPHA)
-        overlay.fill((30, 38, 48, 52))
-        pygame.draw.rect(overlay, (220, 230, 244, 126), overlay.get_rect(), 2, border_radius=3)
+        draw_vertical_gradient(overlay, (23, 35, 50), (10, 16, 27))
+        overlay.set_alpha(112)
+        pygame.draw.rect(overlay, (222, 237, 255, 172), overlay.get_rect(), 2, border_radius=4)
         for i in (1, 2):
             x = i * STRIKE_ZONE.width / 3
             y = i * STRIKE_ZONE.height / 3
-            pygame.draw.line(overlay, (220, 230, 244, 72), (x, 0), (x, STRIKE_ZONE.height), 1)
-            pygame.draw.line(overlay, (220, 230, 244, 72), (0, y), (STRIKE_ZONE.width, y), 1)
+            pygame.draw.line(overlay, (232, 241, 255, 82), (x, 0), (x, STRIKE_ZONE.height), 1)
+            pygame.draw.line(overlay, (232, 241, 255, 82), (0, y), (STRIKE_ZONE.width, y), 1)
         self.screen.blit(overlay, STRIKE_ZONE.topleft)
 
     def draw_pitch(self, now):
@@ -1052,7 +1116,9 @@ class Game:
             )
             pygame.draw.circle(self.screen, color, (int(x), int(y)), max(1, int(r * 0.42)))
         pos, radius = self.pitch.screen_position(now)
+        draw_soft_circle(self.screen, (int(pos.x), int(pos.y)), radius * 2.2, (255, 248, 210, 58), 6)
         pygame.draw.circle(self.screen, (250, 250, 246), (int(pos.x), int(pos.y)), int(radius))
+        pygame.draw.circle(self.screen, (255, 255, 255), (int(pos.x - radius * 0.25), int(pos.y - radius * 0.25)), max(1, int(radius * 0.18)))
         pygame.draw.circle(self.screen, (156, 38, 44), (int(pos.x - radius * 0.15), int(pos.y)), max(1, int(radius * 0.16)))
         pygame.draw.arc(
             self.screen,
@@ -1067,18 +1133,20 @@ class Game:
         data = SWING_TYPES[self.swing_mode]
         radius = data["pci"] * (0.92 + 0.04 * math.sin(now * 8.0))
         center = (int(self.pci_pos.x), int(self.pci_pos.y))
-        pygame.draw.circle(self.screen, (255, 218, 44), center, int(radius), 3)
-        pygame.draw.circle(self.screen, (255, 242, 126), center, 7)
+        draw_soft_circle(self.screen, center, radius * 0.78, (255, 222, 66, 50), 7)
+        pygame.draw.circle(self.screen, (255, 218, 44), center, int(radius), 2)
+        pygame.draw.circle(self.screen, (255, 246, 161), center, int(radius * 0.52), 1)
+        pygame.draw.circle(self.screen, (255, 242, 126), center, 8)
         pygame.draw.circle(self.screen, (40, 35, 8), center, 3)
         for angle in (0, math.pi / 2, math.pi, math.pi * 1.5):
             inner = pygame.Vector2(math.cos(angle), math.sin(angle)) * (radius * 0.35)
             outer = pygame.Vector2(math.cos(angle), math.sin(angle)) * (radius * 0.64)
             pygame.draw.line(
                 self.screen,
-                (255, 230, 64),
+                (255, 235, 84),
                 self.pci_pos + inner,
                 self.pci_pos + outer,
-                4,
+                5,
             )
 
     def draw_bat_swing(self, now):
@@ -1113,18 +1181,25 @@ class Game:
             self.draw_fielder(fielder)
         if self.hit_ball:
             self.draw_hit_ball()
+        self.draw_vignette()
         self.draw_center_feedback(now)
 
     def draw_field_background(self):
-        self.screen.fill((28, 91, 55))
-        pygame.draw.rect(self.screen, (18, 31, 45), (0, 0, WIDTH, 118))
+        draw_vertical_gradient(self.screen, (18, 94, 58), (18, 76, 48))
+        for i in range(13):
+            y = 112 + i * 46
+            color = (25, 116, 66) if i % 2 == 0 else (20, 92, 57)
+            pygame.draw.polygon(self.screen, color, [(0, y), (WIDTH, y - 34), (WIDTH, y + 12), (0, y + 46)])
+        pygame.draw.rect(self.screen, (13, 23, 37), (0, 0, WIDTH, 118))
+        pygame.draw.rect(self.screen, (109, 78, 55), (0, 118, WIDTH, 24))
         for x in range(0, WIDTH, 24):
-            pygame.draw.circle(self.screen, (50 + x % 37, 56, 75), (x + 8, 74 + (x % 5)), 3)
-        pygame.draw.arc(self.screen, (35, 115, 68), (-44, 86, WIDTH + 88, 970), math.radians(202), math.radians(338), 80)
-        pygame.draw.arc(self.screen, (31, 74, 52), (-34, 116, WIDTH + 68, 910), math.radians(202), math.radians(338), 16)
+            shade = 48 + x % 38
+            pygame.draw.circle(self.screen, (shade, shade + 7, shade + 25), (x + 8, 74 + (x % 5)), 3)
+        pygame.draw.arc(self.screen, (41, 129, 75), (-44, 86, WIDTH + 88, 970), math.radians(202), math.radians(338), 82)
+        pygame.draw.arc(self.screen, (24, 61, 46), (-34, 116, WIDTH + 68, 910), math.radians(202), math.radians(338), 18)
         pygame.draw.polygon(
             self.screen,
-            (145, 99, 61),
+            (157, 105, 64),
             [
                 world_to_screen(0, 0),
                 world_to_screen(90, 90),
@@ -1132,7 +1207,19 @@ class Game:
                 world_to_screen(-90, 90),
             ],
         )
-        pygame.draw.circle(self.screen, (136, 91, 58), world_to_screen(0, 60), 24)
+        pygame.draw.polygon(
+            self.screen,
+            (100, 68, 45),
+            [
+                world_to_screen(0, 0),
+                world_to_screen(90, 90),
+                world_to_screen(0, 180),
+                world_to_screen(-90, 90),
+            ],
+            3,
+        )
+        pygame.draw.circle(self.screen, (140, 92, 58), world_to_screen(0, 60), 25)
+        pygame.draw.circle(self.screen, (96, 65, 43), world_to_screen(0, 60), 25, 2)
 
     def draw_field_lines(self):
         white = (226, 226, 210)
@@ -1160,9 +1247,12 @@ class Game:
 
     def draw_fielder(self, fielder):
         p = world_to_screen(fielder.pos.x, fielder.pos.y)
-        pygame.draw.ellipse(self.screen, (18, 45, 31), (p.x - 10, p.y + 8, 20, 7))
+        pygame.draw.ellipse(self.screen, (8, 31, 22), (p.x - 12, p.y + 8, 24, 8))
+        pygame.draw.circle(self.screen, (17, 31, 49), (int(p.x), int(p.y)), 11)
         pygame.draw.circle(self.screen, fielder.color, (int(p.x), int(p.y)), 9)
-        pygame.draw.circle(self.screen, (237, 220, 190), (int(p.x), int(p.y - 9)), 5)
+        pygame.draw.rect(self.screen, (235, 240, 248), (p.x - 6, p.y - 3, 12, 8), border_radius=3)
+        pygame.draw.circle(self.screen, (237, 220, 190), (int(p.x), int(p.y - 10)), 5)
+        pygame.draw.circle(self.screen, (30, 45, 76), (int(p.x), int(p.y - 14)), 5)
         label = self.fonts["small"].render(fielder.name, True, (236, 240, 248))
         self.screen.blit(label, label.get_rect(center=(p.x, p.y + 21)))
 
@@ -1176,6 +1266,7 @@ class Game:
         shadow = world_to_screen(ball.pos.x, ball.pos.y, 0)
         pygame.draw.ellipse(self.screen, (18, 49, 31), (shadow.x - 6, shadow.y - 2, 12, 5))
         p = world_to_screen(ball.pos.x, ball.pos.y, ball.pos.z)
+        draw_soft_circle(self.screen, (int(p.x), int(p.y)), 20, (255, 226, 133, 46), 5)
         pygame.draw.circle(self.screen, (255, 252, 238), (int(p.x), int(p.y)), 6)
         pygame.draw.circle(self.screen, (178, 39, 44), (int(p.x - 2), int(p.y)), 2)
         self.last_hit_distance = ball.max_distance
@@ -1188,10 +1279,7 @@ class Game:
             self.draw_in_play_panel()
 
     def draw_score_bug(self):
-        panel = pygame.Surface((292, 176), pygame.SRCALPHA)
-        panel.fill((12, 16, 24, 202))
-        pygame.draw.rect(panel, (255, 255, 255, 38), panel.get_rect(), 1, border_radius=6)
-        self.screen.blit(panel, (20, 18))
+        draw_glass_panel(self.screen, (20, 18, 340, 184), (8, 13, 23, 210), (255, 255, 255, 42), 10)
 
         title = self.fonts["score"].render(f"JIJ {self.player_score}  CPU {self.cpu_score}", True, (248, 250, 255))
         self.screen.blit(title, (38, 30))
@@ -1201,14 +1289,17 @@ class Game:
         self.draw_count_dots("Balls", self.balls, 4, (79, 224, 132), 40, 108)
         self.draw_count_dots("Strikes", self.strikes, 3, (245, 188, 70), 40, 134)
         self.draw_count_dots("Outs", self.outs, 3, (255, 97, 97), 40, 160)
-        self.draw_bases(232, 126)
+        self.draw_bases(292, 132)
 
     def draw_count_dots(self, label, count, total, color, x, y):
         text = self.fonts["small"].render(label, True, (205, 214, 226))
         self.screen.blit(text, (x, y - 10))
         for i in range(total):
             fill = color if i < count else (65, 72, 84)
+            if i < count:
+                draw_soft_circle(self.screen, (x + 88 + i * 20, y), 13, (*color, 42), 4)
             pygame.draw.circle(self.screen, fill, (x + 88 + i * 20, y), 7)
+            pygame.draw.circle(self.screen, (255, 255, 255, 46), (x + 88 + i * 20, y), 7, 1)
 
     def draw_bases(self, cx, cy):
         points = [
@@ -1226,12 +1317,9 @@ class Game:
             pygame.draw.polygon(self.screen, (229, 235, 245), diamond, 1)
 
     def draw_feedback_panel(self):
-        panel = pygame.Surface((346, 168), pygame.SRCALPHA)
-        panel.fill((12, 16, 24, 190))
-        pygame.draw.rect(panel, (255, 255, 255, 34), panel.get_rect(), 1, border_radius=6)
         x = WIDTH - 366
         y = 18
-        self.screen.blit(panel, (x, y))
+        draw_glass_panel(self.screen, (x, y, 346, 168), (8, 13, 23, 196), (255, 255, 255, 38), 10)
 
         pitch = self.pitch_feedback
         timing_color = TIMING_COLORS.get(self.timing_feedback, (232, 236, 244))
@@ -1251,19 +1339,15 @@ class Game:
     def draw_controls_strip(self):
         text = "Muis: PCI   Linksklik/Space: normal   Rechtermuisknop/X: power   Shift+klik/C: contact   R: reset"
         surf = self.fonts["small"].render(text, True, (216, 224, 236))
-        bg = pygame.Surface((surf.get_width() + 28, 34), pygame.SRCALPHA)
-        bg.fill((11, 15, 22, 172))
-        rect = bg.get_rect(center=(WIDTH // 2, HEIGHT - 24))
-        self.screen.blit(bg, rect)
+        rect = pygame.Rect(0, 0, surf.get_width() + 36, 36)
+        rect.center = (WIDTH // 2, HEIGHT - 24)
+        draw_glass_panel(self.screen, rect, (8, 13, 23, 172), (255, 255, 255, 30), 9)
         self.screen.blit(surf, surf.get_rect(center=rect.center))
 
     def draw_in_play_panel(self):
-        panel = pygame.Surface((268, 86), pygame.SRCALPHA)
-        panel.fill((12, 16, 24, 194))
-        pygame.draw.rect(panel, (255, 255, 255, 34), panel.get_rect(), 1, border_radius=6)
         x = 20
         y = HEIGHT - 124
-        self.screen.blit(panel, (x, y))
+        draw_glass_panel(self.screen, (x, y, 286, 92), (8, 13, 23, 202), (255, 255, 255, 38), 10)
         dist = self.fonts["bold"].render(f"Afstand {self.last_hit_distance:.0f} ft", True, (255, 236, 120))
         self.screen.blit(dist, (x + 18, y + 16))
         metric = self.fonts["small"].render(f"{self.last_hit_distance * 0.3048:.0f} meter | {self.last_hit_type}", True, (218, 226, 238))
